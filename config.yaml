@@ -1,0 +1,244 @@
+data:
+  # The intensity preprocessing branch used by MONAI.
+  # Keep one config focused on one modality family at a time.
+  modality: mri  # ct | mri
+
+  # Final batch contract is always:
+  # batch["image"], batch["seg_label"], batch["T_label"]
+  # If a dataset has no T label, the loader will emit this fallback value.
+  default_t_label: -1
+
+  # Standard key names used after folder scanning.
+  source_keys:
+    seg_label: seg_label
+    t_label: T_label
+
+  # Optional path to save the auto-generated split datalist as JSON.
+  # Set to null if you do not want to export it.
+  generated_datalist_path: ./cache/discovered_datalist.json
+
+  # Define channel layouts here instead of hard-coding them in Python.
+  # Add new input organizations in the future, for example:
+  # single_image:
+  #   image_keys: ["image"]
+  channel_definitions:
+    brats:
+      image_keys: ["t1n", "t1c", "t2f", "t2w"]
+    ucsd_brats_like:
+      image_keys: ["flair", "t1post", "t1pre", "t2"]
+    ucsf_brats_like:
+      image_keys: ["t1", "t1c", "t2", "flair"]
+    utsw_brats_like:
+      image_keys: ["t1", "t1ce", "t2", "flair"]
+    vestibular_t1c:
+      image_keys: ["t1c"]
+
+  # Train/val/test split.
+  # Default is 7/1/2, and the split is performed independently per dataset.
+  split:
+    ratios:
+      training: 7
+      validation: 1
+      test: 2
+    seed: 42
+
+  io:
+    # Configure the file type expected by MONAI.
+    # Use "dcm" when a sample path points to a DICOM series or folder.
+    image_file_format: auto       # auto | nii.gz | nifti | dcm | dicom
+    seg_label_file_format: auto   # auto | nii.gz | nifti | dcm | dicom
+    image_reader: auto            # auto | NibabelReader | PydicomReader | ITKReader
+    seg_label_reader: auto        # auto | NibabelReader | PydicomReader | ITKReader
+
+  cache:
+    mode: persistent              # persistent | cache | none
+    cache_dir: ./cache/medical_loader
+    cache_rate: 1.0
+    num_workers: 4
+
+  loader:
+    batch_size: 2
+    num_workers: 4
+    pin_memory: true
+    drop_last: false
+
+  preprocessing:
+    orientation: RAS
+    spacing: null                 # e.g. [1.0, 1.0, 1.0]
+    spatial_size: [128, 128, 128]
+    crop_foreground:
+      enabled: false
+      threshold: 0.0
+    intensity:
+      ct:
+        a_min: -200.0
+        a_max: 300.0
+        b_min: 0.0
+        b_max: 1.0
+        clip: true
+      mri:
+        lower: 0.5
+        upper: 99.5
+        b_min: 0.0
+        b_max: 1.0
+        clip: true
+
+  augmentation:
+    train:
+      rand_flip_prob: 0.5
+      rand_scale_intensity_prob: 0.5
+      rand_scale_intensity_factor: 0.1
+      rand_shift_intensity_prob: 0.5
+      rand_shift_intensity_offset: 0.1
+
+  # Each dataset can have a different folder layout.
+  #
+  # layout: directory_cases
+  #   `case_glob` defines which folders correspond to one sample.
+  #   `patterns` define how to find each modality file inside that sample folder.
+  #   A pattern can be a single string, or a list used as fallback in order.
+  #
+  # layout: flat_suffix_grouped
+  #   Use this when all files live in one folder and one sample must be grouped
+  #   from file-name suffixes, for example "..._T1C.nii.gz" and "..._T1C_seg.nii.gz".
+  #
+  # Important:
+  # Do not enable datasets with different channel counts in the same run.
+  # The 4-channel MRI datasets below can be grouped together if you want.
+  # The single-channel Vestibular dataset should be used separately.
+  datasets:
+    - name: brats_africa
+      enabled: true
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-Africa
+      channel_type: brats
+      has_t_label: false
+      skip_incomplete_cases: true      # skip a case if any required modality or label file is missing
+      case_glob: "*/*"
+      sample_id_mode: relative_path      # dirname | relative_path | parent_dirname | grandparent_dirname
+      split_group_mode: dirname          # use parent_dirname if you want group-wise split by patient
+      patterns:
+        t1n: "*-t1n.nii.gz"
+        t1c: "*-t1c.nii.gz"
+        t2f: "*-t2f.nii.gz"
+        t2w: "*-t2w.nii.gz"
+        seg_label: "*-seg.nii.gz"
+
+    - name: ucsd_ptgbm
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSD-PTGBM
+      channel_type: ucsd_brats_like
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "UCSD-PTGBM-*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        flair: "*_FLAIR.nii.gz"
+        t1post: "*_T1post.nii.gz"
+        t1pre: "*_T1pre.nii.gz"
+        t2: "*_T2.nii.gz"
+        # BraTS_tumor_seg is the most complete primary tumor label in this dataset.
+        seg_label: "*_BraTS_tumor_seg.nii.gz"
+
+    - name: ucsf_pdgm_v5
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSF-PDGM-v5
+      channel_type: ucsf_brats_like
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "UCSF-PDGM-*_nifti"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        t1: "*_T1.nii.gz"
+        t1c: "*_T1c.nii.gz"
+        t2: "*_T2.nii.gz"
+        flair: "*_FLAIR.nii.gz"
+        seg_label: "*_tumor_segmentation.nii.gz"
+
+    - name: utsw_glioma
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UTSW-Glioma
+      channel_type: utsw_brats_like
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "BT*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        t1: "brain_t1.nii.gz"
+        t1ce: "brain_t1ce.nii.gz"
+        t2: "brain_t2.nii.gz"
+        flair: "brain_flair.nii.gz"
+        # Prefer the manually corrected label already aligned to image space.
+        # If it is missing, fall back to FeTS so the sample is still usable.
+        seg_label:
+          - "rtumorseg_manual_correction.nii.gz"
+          - "tumorseg_FeTS.nii.gz"
+
+    - name: vestibular_schwannoma_mc_rc2
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/Vestibular-Schwannoma-MC-RC2_Oct2025
+      channel_type: vestibular_t1c
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      # Split at patient level, not at scan-date level.
+      split_group_regex: "^(VS_MC_RC2_\\d+)_"
+      suffixes:
+        t1c: "T1C"
+        seg_label: "T1C_seg"
+
+    # - name: brats_peds_v1
+    #   enabled: true
+    #   root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-PEDs-v1
+    #   channel_type: brats
+    #   has_t_label: false
+    #   skip_incomplete_cases: true
+    #   case_glob: "Training/*"
+    #   sample_id_mode: relative_path
+    #   split_group_mode: dirname
+    #   patterns:
+    #     t1n: "*-t1n.nii.gz"
+    #     t1c: "*-t1c.nii.gz"
+    #     t2f: "*-t2f.nii.gz"
+    #     t2w: "*-t2w.nii.gz"
+    #     seg_label: "*-seg.nii.gz"
+
+    # - name: mu_glioma_post
+    #   enabled: true
+    #   root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/MU-Glioma-Post
+    #   channel_type: brats
+    #   has_t_label: false
+    #   skip_incomplete_cases: true
+    #   case_glob: "PatientID_*/Timepoint_*"
+    #   sample_id_mode: relative_path
+    #   split_group_mode: parent_dirname   # avoid splitting the same patient across train/val/test
+    #   patterns:
+    #     t1n: "*_brain_t1n.nii.gz"
+    #     t1c: "*_brain_t1c.nii.gz"
+    #     t2f: "*_brain_t2f.nii.gz"
+    #     t2w: "*_brain_t2w.nii.gz"
+    #     seg_label: "*_tumorMask.nii.gz"
+
+  # Future T-label example:
+  # - name: example_with_t_stage
+  #   enabled: true
+  #   root_dir: /path/to/dataset
+  #   channel_type: single_image
+  #   has_t_label: true
+  #   t_label_map_path: ./labels.csv
+  #   t_label_key_column: case_id
+  #   t_label_value_column: T_label
+  #   t_label_lookup_key_mode: sample_id  # sample_id | dirname | parent_dirname
+  #   case_glob: "*"
+  #   sample_id_mode: dirname
+  #   split_group_mode: dirname
+  #   patterns:
+  #     image: "*.nii.gz"
+  #     seg_label: "*_seg.nii.gz"
