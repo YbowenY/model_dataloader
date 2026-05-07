@@ -425,11 +425,15 @@ def _resolve_single_pattern_match(case_dir: Path, pattern: str, key_name: str) -
 
 
 def _resolve_path_match(case_dir: Path, pattern_or_patterns: Any, key_name: str) -> str:
-    if isinstance(pattern_or_patterns, Sequence) and not isinstance(pattern_or_patterns, (str, bytes)):
+    if (
+        not isinstance(pattern_or_patterns, (str, bytes, Mapping))
+        and hasattr(pattern_or_patterns, "__iter__")
+    ):
+        pattern_list = [str(pattern) for pattern in pattern_or_patterns]
         errors = []
-        for pattern in pattern_or_patterns:
+        for pattern in pattern_list:
             try:
-                return _resolve_single_pattern_match(case_dir, str(pattern), key_name)
+                return _resolve_single_pattern_match(case_dir, pattern, key_name)
             except FileNotFoundError as exc:
                 errors.append(str(exc))
 
@@ -553,11 +557,11 @@ def _discover_dataset_samples(
             }
 
             for image_key in image_source_keys:
-                sample[image_key] = _resolve_path_match(case_dir, str(patterns[image_key]), image_key)
+                sample[image_key] = _resolve_path_match(case_dir, patterns[image_key], image_key)
 
             sample[seg_source_key] = _resolve_path_match(
                 case_dir,
-                str(patterns[seg_source_key]),
+                patterns[seg_source_key],
                 seg_source_key,
             )
 

@@ -17,7 +17,7 @@ data:
   # Set to null if you do not want to export it.
   generated_datalist_path: ./cache/discovered_datalist.json
 
-  # Define channel layouts here instead of hard-coding them in Python.
+  # Define channel layouts
   # Add new input organizations in the future, for example:
   # single_image:
   #   image_keys: ["image"]
@@ -125,7 +125,7 @@ data:
         seg_label: "*-seg.nii.gz"
 
     - name: ucsd_ptgbm
-      enabled: false
+      enabled: true
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSD-PTGBM
       channel_type: ucsd_brats_like
@@ -143,7 +143,7 @@ data:
         seg_label: "*_BraTS_tumor_seg.nii.gz"
 
     - name: ucsf_pdgm_v5
-      enabled: false
+      enabled: true
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSF-PDGM-v5
       channel_type: ucsf_brats_like
@@ -159,8 +159,54 @@ data:
         flair: "*_FLAIR.nii.gz"
         seg_label: "*_tumor_segmentation.nii.gz"
 
-    - name: utsw_glioma
+    - name: vestibular_schwannoma_mc_rc2
       enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/Vestibular-Schwannoma-MC-RC2_Oct2025
+      channel_type: vestibular_t1c
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      # Split at patient level, not at scan-date level.
+      split_group_regex: "^(VS_MC_RC2_\\d+)_"
+      suffixes:
+        t1c: "T1C"
+        seg_label: "T1C_seg"
+
+    - name: brats_peds_v1
+      enabled: true
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-PEDs-v1
+      channel_type: brats
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "Training/*"
+      sample_id_mode: relative_path
+      split_group_mode: dirname
+      patterns:
+        t1n: "*-t1n.nii.gz"
+        t1c: "*-t1c.nii.gz"
+        t2f: "*-t2f.nii.gz"
+        t2w: "*-t2w.nii.gz"
+        seg_label: "*-seg.nii.gz"
+
+    - name: mu_glioma_post
+      enabled: true
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/MU-Glioma-Post
+      channel_type: brats
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "PatientID_*/Timepoint_*"
+      sample_id_mode: relative_path
+      split_group_mode: parent_dirname   # avoid splitting the same patient across train/val/test
+      patterns:
+        t1n: "*_brain_t1n.nii.gz"
+        t1c: "*_brain_t1c.nii.gz"
+        t2f: "*_brain_t2f.nii.gz"
+        t2w: "*_brain_t2w.nii.gz"
+        seg_label: "*_tumorMask.nii.gz"
+
+    - name: utsw_glioma
+      enabled: true
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UTSW-Glioma
       channel_type: utsw_brats_like
@@ -179,54 +225,7 @@ data:
         seg_label:
           - "rtumorseg_manual_correction.nii.gz"
           - "tumorseg_FeTS.nii.gz"
-
-    - name: vestibular_schwannoma_mc_rc2
-      enabled: false
-      layout: flat_suffix_grouped
-      root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/Vestibular-Schwannoma-MC-RC2_Oct2025
-      channel_type: vestibular_t1c
-      has_t_label: false
-      skip_incomplete_cases: true
-      grouped_file_glob: "*.nii.gz"
-      # Split at patient level, not at scan-date level.
-      split_group_regex: "^(VS_MC_RC2_\\d+)_"
-      suffixes:
-        t1c: "T1C"
-        seg_label: "T1C_seg"
-
-    # - name: brats_peds_v1
-    #   enabled: true
-    #   root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-PEDs-v1
-    #   channel_type: brats
-    #   has_t_label: false
-    #   skip_incomplete_cases: true
-    #   case_glob: "Training/*"
-    #   sample_id_mode: relative_path
-    #   split_group_mode: dirname
-    #   patterns:
-    #     t1n: "*-t1n.nii.gz"
-    #     t1c: "*-t1c.nii.gz"
-    #     t2f: "*-t2f.nii.gz"
-    #     t2w: "*-t2w.nii.gz"
-    #     seg_label: "*-seg.nii.gz"
-
-    # - name: mu_glioma_post
-    #   enabled: true
-    #   root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/MU-Glioma-Post
-    #   channel_type: brats
-    #   has_t_label: false
-    #   skip_incomplete_cases: true
-    #   case_glob: "PatientID_*/Timepoint_*"
-    #   sample_id_mode: relative_path
-    #   split_group_mode: parent_dirname   # avoid splitting the same patient across train/val/test
-    #   patterns:
-    #     t1n: "*_brain_t1n.nii.gz"
-    #     t1c: "*_brain_t1c.nii.gz"
-    #     t2f: "*_brain_t2f.nii.gz"
-    #     t2w: "*_brain_t2w.nii.gz"
-    #     seg_label: "*_tumorMask.nii.gz"
-
-  # Future T-label example:
+  # T-label example:
   # - name: example_with_t_stage
   #   enabled: true
   #   root_dir: /path/to/dataset
