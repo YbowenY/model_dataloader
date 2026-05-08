@@ -26,6 +26,10 @@ from monai.transforms import (
     ScaleIntensityRanged,
     ScaleIntensityRangePercentilesd,
     Spacingd,
+    SpatialPadd,
+    ResizeWithPadOrCropd,
+    ConvertToMultiChannelBasedOnBratsClassesd,
+    RandSpatialCropd
 )
 from monai.transforms.transform import MapTransform
 from torch.utils.data import DataLoader
@@ -114,6 +118,17 @@ class StandardizeMedicalBatchd(MapTransform):
             d["T_label"] = d[self.t_source_key]
         else:
             d["T_label"] = self.default_t_label
+
+        # 删除不同数据集各自的原始模态 key，避免 DataLoader collate 报 KeyError
+        for key in image_source_keys:
+            if key not in {"image", "seg_label", "T_label"}:
+                d.pop(key, None)
+
+        if self.seg_source_key not in {"image", "seg_label", "T_label"}:
+            d.pop(self.seg_source_key, None)
+
+        if self.t_source_key not in {"image", "seg_label", "T_label"}:
+            d.pop(self.t_source_key, None)
 
         return d
 
@@ -306,6 +321,40 @@ def _build_resize_transform(cfg: DictConfig):
         mode=("trilinear", "nearest"),
     )
 
+def _build_pad_crop_transform(cfg: DictConfig):
+    spatial_size = cfg.data.preprocessing.spatial_size
+    if spatial_size is None:
+        return None
+
+    spatial_size = tuple(int(v) for v in spatial_size)
+
+    return ResizeWithPadOrCropd(
+        keys=["image", "seg_label"],
+        spatial_size=spatial_size,
+        mode="constant",
+    )
+
+def _build_spatial_crop_transform(cfg: DictConfig):
+    spatial_size = cfg.data.preprocessing.spatial_size
+    if spatial_size is None:
+        return None
+
+    spatial_size = tuple(int(v) for v in spatial_size)
+
+    return Compose(
+        [
+            SpatialPadd(
+                keys=["image", "seg_label"],
+                spatial_size=spatial_size,
+                mode="constant",
+            ),
+            RandSpatialCropd(
+                keys=["image", "seg_label"],
+                roi_size=spatial_size,
+                random_size=False,
+            ),
+        ]
+    )
 
 def _build_spacing_transform(cfg: DictConfig):
     spacing = cfg.data.preprocessing.spacing
@@ -334,6 +383,7 @@ def make_medical_transform(
     seg_reader = _maybe_build_reader(cfg.data.io.seg_label_file_format, cfg.data.io.seg_label_reader)
 
     transforms = [
+        # 统一字段名
         StandardizeMedicalBatchd(
             image_source_keys=None,
             seg_source_key=str(source_keys.seg_label),
@@ -341,17 +391,24 @@ def make_medical_transform(
             has_t_label=False,
             default_t_label=int(cfg.data.default_t_label),
         ),
+        # 读取文件
         LoadImaged(keys=["image"], reader=image_reader, ensure_channel_first=True),
         LoadImaged(keys=["seg_label"], reader=seg_reader, ensure_channel_first=True),
     ]
 
+    # 统一方向
     if preprocessing.orientation:
         transforms.append(Orientationd(keys=["image", "seg_label"], axcodes=str(preprocessing.orientation)))
-
+    
+    # 统一体素间距
     spacing_transform = _build_spacing_transform(cfg)
     if spacing_transform is not None:
         transforms.append(spacing_transform)
 
+    if preprocessing.convert_brats_classes:
+        transforms.append(ConvertToMultiChannelBasedOnBratsClassesd(keys="seg_label"))
+
+    # 裁剪背景
     if preprocessing.crop_foreground.enabled:
         transforms.append(
             CropForegroundd(
@@ -361,12 +418,18 @@ def make_medical_transform(
             )
         )
 
+    use_sliding_window = bool(cfg.get("inference", {}).get("use_sliding_window", False))
+    apply_spatial_crop = is_train or not use_sliding_window
+    # 空间裁剪
+    if apply_spatial_crop:
+        spatial_crop_transform = _build_spatial_crop_transform(cfg)
+        if spatial_crop_transform is not None:
+            transforms.append(spatial_crop_transform)
+
+    # 强度归一化
     transforms.append(_build_intensity_transform(cfg))
-
-    resize_transform = _build_resize_transform(cfg)
-    if resize_transform is not None:
-        transforms.append(resize_transform)
-
+    
+    # 训练集增强
     if is_train:
         flip_prob = float(train_aug.rand_flip_prob)
         for axis in range(3):
@@ -850,13 +913,16 @@ def make_medical_dataloader(
     if split == "training":
         shuffle = True if is_train is None else bool(is_train)
         drop_last = bool(cfg.data.loader.drop_last)
+        batch_size = int(cfg.data.loader.batch_size)
     else:
         shuffle = False
         drop_last = False
+        use_sliding_window = bool(cfg.get("inference", {}).get("use_sliding_window", False))
+        batch_size = 1 if use_sliding_window else int(cfg.data.loader.batch_size)
 
     return DataLoader(
         dataset,
-        batch_size=int(cfg.data.loader.batch_size),
+        batch_size=batch_size,
         shuffle=shuffle,
         num_workers=int(cfg.data.loader.num_workers),
         pin_memory=bool(cfg.data.loader.pin_memory),

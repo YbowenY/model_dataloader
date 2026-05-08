@@ -51,7 +51,7 @@ data:
     seg_label_reader: auto        # auto | NibabelReader | PydicomReader | ITKReader
 
   cache:
-    mode: persistent              # persistent | cache | none
+    mode: none              # persistent | cache | none
     cache_dir: ./cache/medical_loader
     cache_rate: 1.0
     num_workers: 4
@@ -66,8 +66,12 @@ data:
     orientation: RAS
     spacing: null                 # e.g. [1.0, 1.0, 1.0]
     spatial_size: [128, 128, 128]
+    patch_size: [128,128,128]
+
+    convert_brats_classes: true
+
     crop_foreground:
-      enabled: false
+      enabled: true
       threshold: 0.0
     intensity:
       ct:
@@ -241,3 +245,9 @@ data:
   #   patterns:
   #     image: "*.nii.gz"
   #     seg_label: "*_seg.nii.gz"
+
+inference:
+  use_sliding_window: false
+  roi_size: [128, 128, 128]
+  sw_batch_size: 1
+  overlap: 0.5
