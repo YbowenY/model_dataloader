@@ -11,10 +11,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 import yaml
-from monai.data import CacheDataset, Dataset, PersistentDataset
+from monai.data import CacheDataset, Dataset, PersistentDataset, list_data_collate
 from monai.transforms import (
     Compose,
+    ConcatItemsd,
     CropForegroundd,
+    DeleteItemsd,
     EnsureTyped,
     Lambdad,
     LoadImaged,
@@ -29,7 +31,8 @@ from monai.transforms import (
     SpatialPadd,
     ResizeWithPadOrCropd,
     ConvertToMultiChannelBasedOnBratsClassesd,
-    RandSpatialCropd
+    RandCropByPosNegLabeld,
+    RandSpatialCropd,
 )
 from monai.transforms.transform import MapTransform
 from torch.utils.data import DataLoader
@@ -156,6 +159,10 @@ def _validate_medical_loader_config(cfg: DictConfig) -> None:
     modality = str(cfg.data.modality).lower()
     if modality not in {"ct", "mri"}:
         raise ValueError(f'Unsupported modality "{cfg.data.modality}". Expected "ct" or "mri".')
+
+    organ = str(cfg.data.get("organ", "brats")).lower()
+    if organ not in {"brats", "abdomen"}:
+        raise ValueError(f'Unsupported organ "{cfg.data.get("organ")}". Expected "brats" or "abdomen".')
 
     cache_mode = str(cfg.data.cache.mode).lower()
     if cache_mode not in {"persistent", "cache", "none"}:
@@ -334,13 +341,42 @@ def _build_pad_crop_transform(cfg: DictConfig):
         mode="constant",
     )
 
-def _build_spatial_crop_transform(cfg: DictConfig):
+def _build_crop_transform(cfg: DictConfig, is_train: bool = True):
+    """Build training crop transform based on config crop_strategy.
+
+    crop_strategy:
+      - randspatial: SpatialPadd + RandSpatialCropd (random crop anywhere)
+      - posneg: SpatialPadd + RandCropByPosNegLabeld (crop around pos/neg label regions)
+
+    posneg is only used during training; val/test fall back to randspatial.
+    """
     spatial_size = cfg.data.preprocessing.spatial_size
     if spatial_size is None:
         return None
 
     spatial_size = tuple(int(v) for v in spatial_size)
+    strategy = str(cfg.data.preprocessing.get("crop_strategy", "randspatial")).lower()
+    use_posneg = is_train and strategy == "posneg"
 
+    if not use_posneg:
+        # randspatial (default) or posneg fallback for val/test
+        return Compose(
+            [
+                SpatialPadd(
+                    keys=["image", "seg_label"],
+                    spatial_size=spatial_size,
+                    mode="constant",
+                ),
+                RandSpatialCropd(
+                    keys=["image", "seg_label"],
+                    roi_size=spatial_size,
+                    random_size=False,
+                ),
+            ]
+        )
+
+    # posneg mode (training only)
+    posneg_cfg = cfg.data.preprocessing.get("posneg_crop", {})
     return Compose(
         [
             SpatialPadd(
@@ -348,10 +384,15 @@ def _build_spatial_crop_transform(cfg: DictConfig):
                 spatial_size=spatial_size,
                 mode="constant",
             ),
-            RandSpatialCropd(
+            RandCropByPosNegLabeld(
                 keys=["image", "seg_label"],
-                roi_size=spatial_size,
-                random_size=False,
+                label_key="seg_label",
+                spatial_size=spatial_size,
+                num_samples=int(posneg_cfg.get("num_samples", 2)),
+                pos=int(posneg_cfg.get("pos", 1)),
+                neg=int(posneg_cfg.get("neg", 1)),
+                image_key="image",
+                image_threshold=float(posneg_cfg.get("image_threshold", 0)),
             ),
         ]
     )
@@ -369,6 +410,120 @@ def _build_spacing_transform(cfg: DictConfig):
     )
 
 
+class AddDefaultTLabeld:
+    """Add ``T_label`` with a constant default value to each sample dict."""
+
+    def __init__(self, default_t_label: int = -1) -> None:
+        self.default_t_label = default_t_label
+
+    def __call__(self, data: Mapping[str, Any]) -> Dict[str, Any]:
+        d = dict(data)
+        d["T_label"] = torch.as_tensor(self.default_t_label, dtype=torch.long)
+        return d
+
+
+class PadSpatialToMatchd(MapTransform):
+    """Pad each key's spatial dimensions to match the maximum across all keys.
+
+    After Spacingd, multi-channel images may have identical voxel spacing but
+    different FOVs (voxel counts).  This transform computes the per-dimension
+    maximum across ``keys`` and right-pads each tensor with zeros.
+    """
+
+    def __init__(self, keys: Sequence[str]) -> None:
+        super().__init__(list(keys))
+
+    def __call__(self, data: Mapping[str, Any]) -> Dict[str, Any]:
+        d = dict(data)
+        ndim = 3
+        max_shape = [0] * ndim
+        for key in self.keys:
+            shape = list(d[key].shape[1:])  # skip channel dim
+            for i in range(ndim):
+                if shape[i] > max_shape[i]:
+                    max_shape[i] = shape[i]
+
+        for key in self.keys:
+            tensor = d[key]
+            shape = list(tensor.shape[1:])  # spatial only: [H, W, D]
+            # torch.nn.functional.pad specifies pairs from last dim forward:
+            # for [C, H, W, D] → pad = [D_l, D_r,  W_l, W_r,  H_l, H_r,  C_l, C_r]
+            pad: List[int] = []
+            for i in range(ndim - 1, -1, -1):  # D, W, H (last to first spatial)
+                pad.extend([0, max_shape[i] - shape[i]])
+            pad.extend([0, 0])  # channel dim
+            if any(p > 0 for p in pad):
+                d[key] = torch.nn.functional.pad(tensor, pad, mode="constant", value=0)
+        return d
+
+
+def _get_enabled_image_keys(cfg: DictConfig) -> List[str]:
+    """Return the image source keys from the first enabled dataset."""
+    enabled_datasets = [ds for ds in cfg.data.datasets if bool(ds.get("enabled", True))]
+    for ds in enabled_datasets:
+        keys = _get_dataset_image_source_keys(cfg, ds)
+        if keys:
+            return list(keys)
+    return []
+
+
+def _build_multi_channel_pre_transforms(
+    cfg: DictConfig,
+    image_keys: List[str],
+    image_reader,
+    seg_reader,
+) -> List:
+    """Build transforms for multi-channel images with potentially different affines.
+
+    Each channel is loaded independently, then all channels + seg_label are
+    re-oriented and re-spaced into a common coordinate grid.  Finally channels
+    are concatenated along dim=0 into ``image``, so the downstream pipeline
+    can use the same ``keys=["image", "seg_label"]`` as the single-channel path.
+    """
+    preprocessing = cfg.data.preprocessing
+    source_keys = cfg.data.source_keys
+    seg_source_key = str(source_keys.seg_label)
+
+    transforms: List = []
+
+    # -- load each image channel independently (avoids affine mismatch) --
+    for key in image_keys:
+        transforms.append(LoadImaged(keys=[key], reader=image_reader, ensure_channel_first=True))
+    transforms.append(LoadImaged(keys=[seg_source_key], reader=seg_reader, ensure_channel_first=True))
+
+    # -- unified orientation --
+    if preprocessing.orientation:
+        transforms.append(
+            Orientationd(keys=image_keys + [seg_source_key], axcodes=str(preprocessing.orientation))
+        )
+
+    # -- unified voxel spacing --
+    spacing = preprocessing.spacing
+    if spacing is not None:
+        spacing_tuple = tuple(float(v) for v in spacing)
+        transforms.append(
+            Spacingd(
+                keys=image_keys + [seg_source_key],
+                pixdim=spacing_tuple,
+                mode=("bilinear",) * len(image_keys) + ("nearest",),
+            )
+        )
+
+    # -- pad all loaded keys to matching spatial sizes (same spacing ≠ same FOV) --
+    transforms.append(PadSpatialToMatchd(keys=image_keys + [seg_source_key]))
+
+    # -- stack channels → "image", then drop individual channel tensors --
+    transforms.append(ConcatItemsd(keys=image_keys, name="image", dim=0))
+    transforms.append(DeleteItemsd(keys=image_keys))
+    # Remove metadata field that references now-deleted keys
+    transforms.append(DeleteItemsd(keys=["_image_source_keys"]))
+
+    # -- set T_label (StandardizeMedicalBatchd is not used in multi-channel path) --
+    transforms.append(AddDefaultTLabeld(default_t_label=int(cfg.data.default_t_label)))
+
+    return transforms
+
+
 def make_medical_transform(
     config: Union[str, Path, DictConfig, Mapping[str, Any]],
     is_train: bool,
@@ -378,37 +533,72 @@ def make_medical_transform(
     source_keys = cfg.data.source_keys
     preprocessing = cfg.data.preprocessing
     train_aug = cfg.data.augmentation.train
+    organ = str(cfg.data.get("organ", "brats")).lower()
 
     image_reader = _maybe_build_reader(cfg.data.io.image_file_format, cfg.data.io.image_reader)
     seg_reader = _maybe_build_reader(cfg.data.io.seg_label_file_format, cfg.data.io.seg_label_reader)
 
-    transforms = [
-        # 统一字段名
-        StandardizeMedicalBatchd(
-            image_source_keys=None,
-            seg_source_key=str(source_keys.seg_label),
-            t_source_key=str(source_keys.t_label),
-            has_t_label=False,
-            default_t_label=int(cfg.data.default_t_label),
-        ),
-        # 读取文件
-        LoadImaged(keys=["image"], reader=image_reader, ensure_channel_first=True),
-        LoadImaged(keys=["seg_label"], reader=seg_reader, ensure_channel_first=True),
-    ]
+    # ──  organ-aware pre-processing: load + orient + space + merge  ──
+    if organ == "brats":
+        # BraTS protocol: all modalities are co-registered (same affine).
+        # StandardizeMedicalBatchd merges all keys into "image" as a list,
+        # then LoadImaged loads and stacks them in one shot.
+        transforms = [
+            StandardizeMedicalBatchd(
+                image_source_keys=None,
+                seg_source_key=str(source_keys.seg_label),
+                t_source_key=str(source_keys.t_label),
+                has_t_label=False,
+                default_t_label=int(cfg.data.default_t_label),
+            ),
+            LoadImaged(keys=["image"], reader=image_reader, ensure_channel_first=True),
+            LoadImaged(keys=["seg_label"], reader=seg_reader, ensure_channel_first=True),
+        ]
+    elif organ == "abdomen":
+        # Abdomen protocol: channels may have different affines (e.g. T1 vs T2).
+        # Multi-channel images are loaded separately, aligned, then concatenated;
+        # single-channel images keep the simple StandardizeMedicalBatchd path.
+        image_source_keys = _get_enabled_image_keys(cfg)
+        if len(image_source_keys) > 1:
+            transforms = _build_multi_channel_pre_transforms(
+                cfg, image_source_keys, image_reader, seg_reader
+            )
+        else:
+            transforms = [
+                StandardizeMedicalBatchd(
+                    image_source_keys=None,
+                    seg_source_key=str(source_keys.seg_label),
+                    t_source_key=str(source_keys.t_label),
+                    has_t_label=False,
+                    default_t_label=int(cfg.data.default_t_label),
+                ),
+                LoadImaged(keys=["image"], reader=image_reader, ensure_channel_first=True),
+                LoadImaged(keys=["seg_label"], reader=seg_reader, ensure_channel_first=True),
+            ]
+    else:
+        raise ValueError(f'Unsupported organ "{organ}". Expected "brats" or "abdomen".')
 
-    # 统一方向
-    if preprocessing.orientation:
-        transforms.append(Orientationd(keys=["image", "seg_label"], axcodes=str(preprocessing.orientation)))
-    
-    # 统一体素间距
-    spacing_transform = _build_spacing_transform(cfg)
-    if spacing_transform is not None:
-        transforms.append(spacing_transform)
+    # ──  post-loading: orientation & spacing  ──
+    # abdomen multi-channel pre-load already handled these; brats / abdomen single-channel have not.
+    pre_already_done = organ == "abdomen" and len(_get_enabled_image_keys(cfg)) > 1
+
+    if not pre_already_done:
+        if preprocessing.orientation:
+            transforms.append(
+                Orientationd(keys=["image", "seg_label"], axcodes=str(preprocessing.orientation))
+            )
+        spacing_transform = _build_spacing_transform(cfg)
+        if spacing_transform is not None:
+            transforms.append(spacing_transform)
 
     if preprocessing.convert_brats_classes:
+        if organ != "brats":
+            raise ValueError(
+                f'convert_brats_classes=True is only valid when organ="brats", '
+                f'but organ is "{organ}".'
+            )
         transforms.append(ConvertToMultiChannelBasedOnBratsClassesd(keys="seg_label"))
 
-    # 裁剪背景
     if preprocessing.crop_foreground.enabled:
         transforms.append(
             CropForegroundd(
@@ -418,18 +608,10 @@ def make_medical_transform(
             )
         )
 
-    use_sliding_window = bool(cfg.get("inference", {}).get("use_sliding_window", False))
-    apply_spatial_crop = is_train or not use_sliding_window
-    # 空间裁剪
-    if apply_spatial_crop:
-        spatial_crop_transform = _build_spatial_crop_transform(cfg)
-        if spatial_crop_transform is not None:
-            transforms.append(spatial_crop_transform)
-
-    # 强度归一化
+    # ──  intensity normalization (after foreground crop, before augmentations)  ──
     transforms.append(_build_intensity_transform(cfg))
-    
-    # 训练集增强
+
+    # ──  training augmentations (applied before crop for compatibility with posneg mode)  ──
     if is_train:
         flip_prob = float(train_aug.rand_flip_prob)
         for axis in range(3):
@@ -449,14 +631,34 @@ def make_medical_transform(
             ]
         )
 
-    transforms.extend(
-        [
-            EnsureTyped(keys=["image", "seg_label", "T_label"]),
-            Lambdad(keys=["image"], func=lambda x: x.float()),
-            Lambdad(keys=["seg_label"], func=lambda x: x.long()),
-            Lambdad(keys=["T_label"], func=lambda x: torch.as_tensor(x, dtype=torch.long)),
-        ]
+    # ──  ensure types before crop (required for posneg list output to carry tensor dtypes)  ──
+    transforms.append(
+        EnsureTyped(
+            keys=["image", "seg_label", "T_label"],
+            dtype=(torch.float32, torch.long, torch.long),
+        )
     )
+
+    # ──  spatial crop ──
+    use_sliding_window = bool(cfg.get("inference", {}).get("use_sliding_window", False))
+    apply_spatial_crop = is_train or not use_sliding_window
+    crop_strategy = str(preprocessing.get("crop_strategy", "randspatial")).lower()
+
+    if apply_spatial_crop:
+        spatial_crop_transform = _build_crop_transform(cfg, is_train=is_train)
+        if spatial_crop_transform is not None:
+            transforms.append(spatial_crop_transform)
+
+        # Type-cast lambdas: only for randspatial (posneg returns a list of dicts)
+        if crop_strategy == "randspatial":
+            transforms.extend(
+                [
+                    Lambdad(keys=["image"], func=lambda x: x.float()),
+                    Lambdad(keys=["seg_label"], func=lambda x: x.long()),
+                    Lambdad(keys=["T_label"], func=lambda x: torch.as_tensor(x, dtype=torch.long)),
+                ]
+            )
+
     return Compose(transforms)
 
 
@@ -920,6 +1122,9 @@ def make_medical_dataloader(
         use_sliding_window = bool(cfg.get("inference", {}).get("use_sliding_window", False))
         batch_size = 1 if use_sliding_window else int(cfg.data.loader.batch_size)
 
+    crop_strategy = str(cfg.data.preprocessing.get("crop_strategy", "randspatial")).lower()
+    use_posneg = split == "training" and crop_strategy == "posneg"
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -927,6 +1132,7 @@ def make_medical_dataloader(
         num_workers=int(cfg.data.loader.num_workers),
         pin_memory=bool(cfg.data.loader.pin_memory),
         drop_last=drop_last,
+        collate_fn=list_data_collate if use_posneg else None,
     )
 
 

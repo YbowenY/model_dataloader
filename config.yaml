@@ -3,6 +3,13 @@ data:
   # Keep one config focused on one modality family at a time.
   modality: mri  # ct | mri
 
+  # Organ type determines the loading and transform strategy.
+  #   brats   – Brain tumor protocols: co-registered multi-channel,
+  #             StandardizeMedicalBatchd merges all keys before LoadImaged.
+  #   abdomen – Abdominal protocols: channels may have different affines,
+  #             loaded separately, aligned, then concatenated.
+  organ: abdomen  # brats | abdomen
+
   # Final batch contract is always:
   # batch["image"], batch["seg_label"], batch["T_label"]
   # If a dataset has no T label, the loader will emit this fallback value.
@@ -15,7 +22,7 @@ data:
 
   # Optional path to save the auto-generated split datalist as JSON.
   # Set to null if you do not want to export it.
-  generated_datalist_path: ./cache/discovered_datalist.json
+  generated_datalist_path: ./cache/cystx_mri_datalist.json
 
   # Define channel layouts
   # Add new input organizations in the future, for example:
@@ -32,6 +39,10 @@ data:
       image_keys: ["t1", "t1ce", "t2", "flair"]
     vestibular_t1c:
       image_keys: ["t1c"]
+    amos_mri:
+      image_keys: ["image"]
+    cystx_mri:
+      image_keys: ["t1", "t2"]
 
   # Train/val/test split.
   # Default is 7/1/2, and the split is performed independently per dataset.
@@ -64,15 +75,26 @@ data:
 
   preprocessing:
     orientation: RAS
-    spacing: null                 # e.g. [1.0, 1.0, 1.0]
-    spatial_size: [128, 128, 128]
-    patch_size: [128,128,128]
+    spacing: [1.0,1.0,1.0]                 # e.g. [1.0, 1.0, 1.0]
+    spatial_size: [128, 128, 64]
+    patch_size: [128,128,64]
 
-    convert_brats_classes: true
+    convert_brats_classes: false
 
     crop_foreground:
       enabled: true
       threshold: 0.0
+
+    # Crop strategy: randspatial (random crop) | posneg (label-based pos/neg crop)
+    crop_strategy: randspatial
+
+    # RandCropByPosNegLabeld parameters (only used when crop_strategy=posneg)
+    posneg_crop:
+      num_samples: 2
+      pos: 1
+      neg: 1
+      image_threshold: 0
+
     intensity:
       ct:
         a_min: -200.0
@@ -112,7 +134,7 @@ data:
   # The single-channel Vestibular dataset should be used separately.
   datasets:
     - name: brats_africa
-      enabled: true
+      enabled: false
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-Africa
       channel_type: brats
@@ -129,7 +151,7 @@ data:
         seg_label: "*-seg.nii.gz"
 
     - name: ucsd_ptgbm
-      enabled: true
+      enabled: false
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSD-PTGBM
       channel_type: ucsd_brats_like
@@ -147,7 +169,7 @@ data:
         seg_label: "*_BraTS_tumor_seg.nii.gz"
 
     - name: ucsf_pdgm_v5
-      enabled: true
+      enabled: false
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UCSF-PDGM-v5
       channel_type: ucsf_brats_like
@@ -177,8 +199,137 @@ data:
         t1c: "T1C"
         seg_label: "T1C_seg"
 
-    - name: brats_peds_v1
+    - name: amos_abdomen_mri
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/AMOS/amos22/mri_flat
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      # Each AMOS patient has a unique ID; split at patient level
+      split_group_regex: "^(amos_\\d+)"
+      suffixes:
+        image: "image"
+        seg_label: "seg_label"
+
+    - name: cystx_abdomen_mri
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/Cyst‑X/osfstorage/Cyst-X_Dataset/cystx_2ch_flat
+      channel_type: cystx_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        t1: "t1.nii.gz"
+        t2: "t2.nii.gz"
+        seg_label: "seg_label.nii.gz"
+
+    # ── MRISegmentator: 4 T1 contrast phases, each treated independently ──
+    # 135 train + 60 test = 195 labelled samples per phase, 63 classes (0–62)
+    - name: mriseg_pre
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/MRISegmentator/MRISegmenter_T1only_public_20Jun2025/mriseg_flat_PRE
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      split_group_regex: "^(train_\\d+|test_\\d+)"
+      suffixes:
+        image: "image"
+        seg_label: "seg_label"
+
+    - name: mriseg_art
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/MRISegmentator/MRISegmenter_T1only_public_20Jun2025/mriseg_flat_ART
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      split_group_regex: "^(train_\\d+|test_\\d+)"
+      suffixes:
+        image: "image"
+        seg_label: "seg_label"
+
+    - name: mriseg_ven
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/MRISegmentator/MRISegmenter_T1only_public_20Jun2025/mriseg_flat_VEN
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      split_group_regex: "^(train_\\d+|test_\\d+)"
+      suffixes:
+        image: "image"
+        seg_label: "seg_label"
+
+    - name: mriseg_del
+      enabled: false
+      layout: flat_suffix_grouped
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/MRISegmentator/MRISegmenter_T1only_public_20Jun2025/mriseg_flat_DEL
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      grouped_file_glob: "*.nii.gz"
+      split_group_regex: "^(train_\\d+|test_\\d+)"
+      suffixes:
+        image: "image"
+        seg_label: "seg_label"
+
+    # DukeCSpineSeg: 1255 MR series, 3 classes (0/1/2)
+    - name: duke_spine_mri
       enabled: true
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Bone/DukeCSpineSeg/duke_spine_nifti
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        image: "image.nii.gz"
+        seg_label: "label.nii.gz"
+
+    # SPIDER bone MRI: 190 t1+t2 paired patients, 20 classes
+    - name: spider_bone_mri
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Bone/SPIDER/spider_nifti
+      channel_type: cystx_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        t1: "t1.nii.gz"
+        t2: "t2.nii.gz"
+        seg_label: "label.nii.gz"
+
+    # totalsegmentator: 527 , num_classes:30
+    - name: totalseg_mri
+      enabled: false
+      layout: directory_cases
+      root_dir: /mnt/liangjm/MEIDATASET/Open/Abdomen/TotalSegmentator
+      channel_type: amos_mri
+      has_t_label: false
+      skip_incomplete_cases: true
+      case_glob: "s*"
+      sample_id_mode: dirname
+      split_group_mode: dirname
+      patterns:
+        image: "mri.nii.gz"
+        seg_label: "label.nii.gz"
+
+    - name: brats_peds_v1
+      enabled: false
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/BraTS-PEDs-v1
       channel_type: brats
       has_t_label: false
@@ -194,7 +345,7 @@ data:
         seg_label: "*-seg.nii.gz"
 
     - name: mu_glioma_post
-      enabled: true
+      enabled: false
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/MU-Glioma-Post
       channel_type: brats
       has_t_label: false
@@ -210,7 +361,7 @@ data:
         seg_label: "*_tumorMask.nii.gz"
 
     - name: utsw_glioma
-      enabled: true
+      enabled: false
       layout: directory_cases
       root_dir: /mnt/liangjm/MEIDATASET/Open/Brain/UTSW-Glioma
       channel_type: utsw_brats_like
@@ -247,7 +398,7 @@ data:
   #     seg_label: "*_seg.nii.gz"
 
 inference:
-  use_sliding_window: false
-  roi_size: [128, 128, 128]
+  use_sliding_window: true
+  roi_size: [128, 128, 64]
   sw_batch_size: 1
   overlap: 0.5
